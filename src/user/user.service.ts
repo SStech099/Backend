@@ -1,47 +1,110 @@
 import { Injectable } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
+import { ConfigService } from '@nestjs/config';
+import { UniswapFactoryAbi } from './abi/IUniswapV2Factory';
+import { UniswapPairAbi } from './abi/IUniswapV2Pair';
+import { Cron, CronExpression } from '@nestjs/schedule';
+const Big = require('big.js');
 
+import Web3 from 'web3';
 @Injectable()
-export class UserService {
-  handleCron() {
-    const Big = require('big.js');
-    const blk = require('./blockchain');
-    const UniswapV2Pair = require('./abi/IUniswapV2Pair.json');
+export class OrdersService {
+  web3SocketConnection: any;
+  constructor(private configService: ConfigService) {
+    const web3 = new Web3();
+    this.fetchPrice();
+  }
 
-    const PAIR_ADDR = '0xa478c2975ab1ea89e8196811f51a7b7ade33eb11';
-    const PAIR_NAME = 'ETH/DAI';
-    const INTERVAL = 1000;
+  async onModuleInit() {
+    this.initiatewebSocket();
+  }
 
-    const PairContractHTTP = new blk.web3http.eth.Contract(
-      UniswapV2Pair.abi,
-      PAIR_ADDR,
+  async initiatewebSocket() {
+    const reconnectOptions = {
+      timeout: 30000,
+      clientConfig: {
+        maxReceivedFrameSize: 100000000,
+        maxReceivedMessageSize: 100000000,
+        keepalive: true,
+        keepaliveInterval: -1,
+      },
+
+      reconnect: {
+        auto: true,
+        delay: 5000, // ms
+        maxAttempts: 99999999,
+        onTimeout: true,
+      },
+    };
+
+    this.web3SocketConnection = new Web3.providers.WebsocketProvider(
+      this.configService.get('WEB3_WSS_PROVIDER'),
+      reconnectOptions,
     );
 
-    //Function to get reserves
-    const getReserves = async (ContractObj) => {
-      //call getReserves of the pair contract
-      const _reserves = await ContractObj.methods.getReserves().call();
+    console.log('hi');
+    this.web3SocketConnection.on('connect', () => {
+      console.log('! provider connected'); // <- fires after successful connection
+      this.startListeningEvents();
+    });
 
-      //return data in Big Number
+    this.web3SocketConnection.on('error', function (err) {
+      console.log('~ on-error:', err); // <- never fires
+      this.initiatewebSocket();
+    });
+
+    this.web3SocketConnection.on('end', async (err) => {
+      console.log('~ on-end:', err); // <- never fires
+      this.initiatewebSocket();
+    });
+
+    this.web3SocketConnection.on('close', (event) => {
+      console.log('~ on-close:', event); // <- never fires
+      this.initiatewebSocket();
+    });
+  }
+
+  async getPair(token1, token2) {
+    console.log('In fetch price');
+    const FACTORY_ADDRESS = this.configService.get('FACTORY_CONTRACT_ADDRESS');
+    const HTTP_URL = this.configService.get('HTTP_URL');
+    const web3http = new Web3(HTTP_URL);
+    console.log(HTTP_URL);
+    // console.log(FACTORY_ADDRESS, WETH_ADDRESS, DAI_ADDRESS);
+
+    const FactoryContractHTTP = new web3http.eth.Contract(
+      UniswapFactoryAbi,
+      FACTORY_ADDRESS,
+    );
+
+    const pair = await FactoryContractHTTP.methods
+      .getPair(token1, token2)
+      .call();
+    return pair;
+  }
+
+  async fetchPrice() {
+    const WETH_ADDRESS = process.env.WETH_CONTRACT_ADDRESS;
+    const DAI_ADDRESS = process.env.DAI_CONTRACT_ADDRESS;
+    const HTTP_URL = process.env.HTTP_URL;
+    const web3http = new Web3(HTTP_URL);
+    const pair = await this.getPair(WETH_ADDRESS, DAI_ADDRESS);
+    const pairContractHTTP = new web3http.eth.Contract(UniswapPairAbi, pair);
+    console.log(pair);
+
+    const getReserves = async (ContractObj) => {
+      const _reserves = await ContractObj.methods.getReserves().call();
       return [Big(_reserves.reserve0), Big(_reserves.reserve1)];
     };
 
-    const sleep = (timeInMs) =>
-      new Promise((resolve) => setTimeout(resolve, timeInMs));
+    const [amtToken0, amtToken1] = await getReserves(pairContractHTTP);
 
-    const main = async () => {
-      //Check price continously
-      while (true) {
-        const [amtToken0, amtToken1] = await getReserves(PairContractHTTP);
+    console.log(
+      `Price of current pair : ${(amtToken0 / amtToken1).toString()}`,
+    );
+  }
 
-        //calculate price and print
-        console.log(
-          `Price ${PAIR_NAME} : ${amtToken0.div(amtToken1).toString()}`,
-        );
-        await sleep(INTERVAL);
-      }
-    };
-
-    main();
+  @Cron(CronExpression.EVERY_30_SECONDS)
+  handleCron() {
+    this.fetchPrice();
   }
 }
